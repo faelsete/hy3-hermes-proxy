@@ -1,0 +1,534 @@
+"""OpenAI-compatible adapter for Tencent's official Hy3 Hugging Face Space.
+
+The upstream public Gradio endpoint is stateless and returns cumulative
+snapshots. This adapter translates those snapshots into OpenAI Chat
+Completions responses so Hermes Agent can use Hy3 as a normal provider.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import time
+import uuid
+from collections.abc import AsyncIterator
+from typing import Any
+
+import httpx
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+
+UPSTREAM_BASE_URL = os.getenv(
+    "HY3_SPACE_URL", "https://tencent-hy3.hf.space"
+).rstrip("/")
+MODEL_ID = os.getenv("HY3_MODEL_ID", "tencent/hy3")
+REQUEST_TIMEOUT = float(os.getenv("HY3_REQUEST_TIMEOUT", "600"))
+MAX_CONCURRENCY = max(1, int(os.getenv("HY3_MAX_CONCURRENCY", "8")))
+MAX_RETRIES = max(0, int(os.getenv("HY3_MAX_RETRIES", "2")))
+MAX_INPUT_CHARS = max(10_000, int(os.getenv("HY3_MAX_INPUT_CHARS", "300000")))
+DEFAULT_MAX_TOKENS = max(1, int(os.getenv("HY3_DEFAULT_MAX_TOKENS", "16384")))
+MAX_OUTPUT_TOKENS = max(
+    DEFAULT_MAX_TOKENS, int(os.getenv("HY3_MAX_OUTPUT_TOKENS", "65536"))
+)
+TRIM_NOTICE = (
+    "[Context note: Older conversation history was omitted by the local Hy3 "
+    "adapter to stay within the model context window. Preserve the current "
+    "request and the recent conversation below.]"
+)
+
+app = FastAPI(title="Tencent Hy3 Hermes Proxy", version="1.1.0")
+_upstream_slots = asyncio.Semaphore(MAX_CONCURRENCY)
+logger = logging.getLogger("uvicorn.error")
+
+
+def _text_content(content: Any) -> str:
+    """Flatten OpenAI text content into the text-only format Hy3 accepts."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        chunks: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                chunks.append(item)
+            elif isinstance(item, dict):
+                if item.get("type") in {"text", "input_text", "output_text"}:
+                    chunks.append(str(item.get("text", "")))
+                elif item.get("type") in {"image_url", "input_image"}:
+                    chunks.append("[Imagem não suportada pelo modelo Hy3 textual]")
+        return "\n".join(chunk for chunk in chunks if chunk)
+    return str(content)
+
+
+def _clean_history_message(message: dict[str, Any]) -> dict[str, Any] | None:
+    role = str(message.get("role", "")).strip()
+    if role not in {"user", "assistant", "tool"}:
+        return None
+
+    cleaned: dict[str, Any] = {
+        "role": role,
+        "content": _text_content(message.get("content")),
+    }
+    for key in ("name", "tool_call_id", "reasoning_content", "reasoning_details"):
+        if message.get(key) is not None:
+            cleaned[key] = message[key]
+    if role == "assistant" and message.get("tool_calls"):
+        cleaned["tool_calls"] = message["tool_calls"]
+    return cleaned
+
+
+def extract_conversation(
+    messages: list[dict[str, Any]],
+) -> tuple[str, list[dict[str, Any]], str]:
+    """Split OpenAI messages into Space system prompt, history and new turn.
+
+    Gradio's public ``/chat`` endpoint requires a fresh user message. During
+    Hermes tool loops, the last message is often a tool result; in that case we
+    preserve the full tool history and append a neutral continuation turn.
+    """
+    system_parts: list[str] = []
+    conversation: list[dict[str, Any]] = []
+
+    for raw in messages or []:
+        role = str(raw.get("role", "")).strip()
+        if role in {"system", "developer"}:
+            text = _text_content(raw.get("content")).strip()
+            if text:
+                system_parts.append(text)
+            continue
+        cleaned = _clean_history_message(raw)
+        if cleaned is not None:
+            conversation.append(cleaned)
+
+    if conversation and conversation[-1]["role"] == "user":
+        last = conversation.pop()
+        message = last.get("content", "").strip()
+    else:
+        message = (
+            "Continue the task using the conversation and tool results above. "
+            "Do not repeat completed work."
+        )
+
+    if not message:
+        message = "Continue the task based on the conversation above."
+
+    return "\n\n".join(system_parts), conversation, message
+
+
+def reasoning_level(request: dict[str, Any]) -> str:
+    """Map OpenAI/Hermes reasoning controls to Hy3's three levels."""
+    effort = request.get("reasoning_effort")
+    reasoning = request.get("reasoning")
+
+    if effort is None and isinstance(reasoning, dict):
+        if reasoning.get("enabled") is False:
+            return "no_think"
+        effort = reasoning.get("effort")
+        if reasoning.get("enabled") is True and effort is None:
+            return "high"
+    elif effort is None and reasoning is False:
+        return "no_think"
+    elif effort is None and reasoning is True:
+        return "high"
+
+    value = str(effort or "high").lower()
+    if value in {"none", "no", "off", "minimal", "no_think"}:
+        return "no_think"
+    if value in {"low", "medium"}:
+        return "low"
+    return "high"
+
+
+def payload_size_chars(data: list[Any]) -> int:
+    """Return the exact serialized character size sent to Gradio."""
+    return len(json.dumps(data, ensure_ascii=False, separators=(",", ":")))
+
+
+def _trim_history_to_budget(
+    data: list[Any], max_input_chars: int
+) -> tuple[list[Any], int]:
+    """Drop complete oldest turns until the Gradio request fits the budget.
+
+    The current user message, system prompt, tools and recent conversation are
+    always preferred. Cutting only at a later user message avoids leaving an
+    orphan assistant/tool message at the start of history.
+    """
+    history = list(data[2] or [])
+    if payload_size_chars(data) <= max_input_chars or not history:
+        return data, 0
+
+    original_count = len(history)
+    data[1] = f"{data[1]}\n\n{TRIM_NOTICE}" if data[1] else TRIM_NOTICE
+
+    while history and payload_size_chars(data) > max_input_chars:
+        next_user = next(
+            (
+                index
+                for index in range(1, len(history))
+                if history[index].get("role") == "user"
+            ),
+            len(history),
+        )
+        history = history[next_user:]
+        data[2] = history or None
+
+    return data, original_count - len(history)
+
+
+def build_upstream_payload(
+    request: dict[str, Any], *, max_input_chars: int = MAX_INPUT_CHARS
+) -> dict[str, Any]:
+    system_prompt, history, message = extract_conversation(
+        request.get("messages") or []
+    )
+    tools = request.get("tools") or []
+    temperature = request.get("temperature")
+    max_tokens = request.get("max_tokens")
+    if max_tokens is None:
+        max_tokens = request.get("max_completion_tokens")
+    try:
+        resolved_max_tokens = int(max_tokens or DEFAULT_MAX_TOKENS)
+    except (TypeError, ValueError):
+        resolved_max_tokens = DEFAULT_MAX_TOKENS
+    resolved_max_tokens = min(max(1, resolved_max_tokens), MAX_OUTPUT_TOKENS)
+    top_p = request.get("top_p")
+
+    data: list[Any] = [
+        message,
+        system_prompt,
+        history or None,
+        reasoning_level(request),
+        temperature,
+        resolved_max_tokens,
+        float(top_p or 0),
+        request.get("preserved_thinking"),
+        json.dumps(tools, ensure_ascii=False) if tools else "",
+    ]
+    data, _ = _trim_history_to_budget(data, max_input_chars)
+    return {"data": data}
+
+
+def parse_gradio_data(raw_data: str) -> dict[str, Any]:
+    """Parse a cumulative Gradio snapshot from one SSE data line."""
+    parsed = json.loads(raw_data)
+    if not isinstance(parsed, list) or not parsed:
+        raise ValueError("Unexpected Gradio payload")
+    values = parsed[0]
+    if not isinstance(values, list) or len(values) < 4:
+        raise ValueError("Incomplete Gradio snapshot")
+    return {
+        "content": values[0] or "",
+        "reasoning": values[1] or "",
+        "tool_calls": values[2] or [],
+        "history": values[3] or [],
+    }
+
+
+def normalize_tool_calls(calls: Any) -> list[dict[str, Any]]:
+    """Normalize Hy3 tool calls to OpenAI's assistant message shape."""
+    if isinstance(calls, str):
+        try:
+            calls = json.loads(calls)
+        except json.JSONDecodeError:
+            return []
+    if not isinstance(calls, list):
+        return []
+
+    normalized: list[dict[str, Any]] = []
+    for raw in calls:
+        if not isinstance(raw, dict):
+            continue
+        fn = raw.get("function") if isinstance(raw.get("function"), dict) else {}
+        name = fn.get("name") or raw.get("name")
+        if not name:
+            continue
+        arguments = fn.get("arguments", raw.get("arguments", {}))
+        if not isinstance(arguments, str):
+            arguments = json.dumps(arguments or {}, ensure_ascii=False)
+        normalized.append(
+            {
+                "id": raw.get("id") or f"call_{uuid.uuid4().hex[:24]}",
+                "type": "function",
+                "function": {"name": str(name), "arguments": arguments},
+            }
+        )
+    return normalized
+
+
+def build_nonstream_response(
+    *, model: str, content: str, reasoning: str, tool_calls: list[dict[str, Any]]
+) -> dict[str, Any]:
+    message: dict[str, Any] = {"role": "assistant", "content": content or ""}
+    if reasoning:
+        message["reasoning_content"] = reasoning
+        message["reasoning"] = reasoning
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+
+    return {
+        "id": f"chatcmpl-hy3-{uuid.uuid4().hex}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": message,
+                "finish_reason": "tool_calls" if tool_calls else "stop",
+            }
+        ],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    }
+
+
+async def _upstream_snapshots(
+    payload: dict[str, Any],
+) -> AsyncIterator[dict[str, Any]]:
+    """Submit a Gradio job and yield cumulative snapshots from its SSE feed."""
+    submit_url = f"{UPSTREAM_BASE_URL}/gradio_api/call/chat"
+    timeout = httpx.Timeout(REQUEST_TIMEOUT, connect=30.0)
+
+    async with _upstream_slots:
+        last_error: Exception | None = None
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    response = await client.post(submit_url, json=payload)
+                    if response.status_code == 429 or response.status_code >= 500:
+                        raise httpx.HTTPStatusError(
+                            f"Hy3 upstream returned {response.status_code}",
+                            request=response.request,
+                            response=response,
+                        )
+                    response.raise_for_status()
+                    event_id = response.json().get("event_id")
+                    if not event_id:
+                        raise RuntimeError("Hy3 upstream did not return event_id")
+
+                    stream_url = f"{submit_url}/{event_id}"
+                    current_event = ""
+                    yielded = False
+                    async with client.stream(
+                        "GET", stream_url, headers={"Accept": "text/event-stream"}
+                    ) as stream:
+                        stream.raise_for_status()
+                        async for line in stream.aiter_lines():
+                            if line.startswith("event:"):
+                                current_event = line[6:].strip()
+                                continue
+                            if not line.startswith("data:"):
+                                continue
+                            data = line[5:].strip()
+                            if current_event in {"generating", "complete"} and data:
+                                yielded = True
+                                yield parse_gradio_data(data)
+                            if current_event == "error":
+                                raise RuntimeError(f"Hy3 upstream error: {data}")
+                            if current_event == "complete":
+                                return
+                    if not yielded:
+                        raise RuntimeError("Hy3 upstream returned no snapshots")
+                    return
+            except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+                last_error = exc
+                if attempt >= MAX_RETRIES:
+                    break
+                await asyncio.sleep(1.5 * (2**attempt))
+
+        raise RuntimeError(f"Hy3 upstream failed after retries: {last_error}")
+
+
+def _suffix(previous: str, current: str) -> str:
+    if not current:
+        return ""
+    if current.startswith(previous):
+        return current[len(previous) :]
+    return current
+
+
+def _sse(data: dict[str, Any] | str) -> str:
+    if isinstance(data, str):
+        return f"data: {data}\n\n"
+    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+async def _openai_stream(
+    request_data: dict[str, Any], payload: dict[str, Any], model: str
+) -> AsyncIterator[str]:
+    completion_id = f"chatcmpl-hy3-{uuid.uuid4().hex}"
+    created = int(time.time())
+    previous_content = ""
+    previous_reasoning = ""
+    final_tools: list[dict[str, Any]] = []
+    sent_role = False
+
+    async for snapshot in _upstream_snapshots(payload):
+        content = str(snapshot.get("content") or "")
+        reasoning = str(snapshot.get("reasoning") or "")
+        delta_content = _suffix(previous_content, content)
+        delta_reasoning = _suffix(previous_reasoning, reasoning)
+        previous_content = content
+        previous_reasoning = reasoning
+        tools = normalize_tool_calls(snapshot.get("tool_calls"))
+        if tools:
+            final_tools = tools
+
+        delta: dict[str, Any] = {}
+        if not sent_role:
+            delta["role"] = "assistant"
+            sent_role = True
+        if delta_reasoning:
+            delta["reasoning_content"] = delta_reasoning
+            delta["reasoning"] = delta_reasoning
+        if delta_content:
+            delta["content"] = delta_content
+
+        if delta:
+            yield _sse(
+                {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+                }
+            )
+
+    if final_tools:
+        tool_deltas = [
+            {"index": index, **tool_call}
+            for index, tool_call in enumerate(final_tools)
+        ]
+        yield _sse(
+            {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"tool_calls": tool_deltas},
+                        "finish_reason": None,
+                    }
+                ],
+            }
+        )
+
+    yield _sse(
+        {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "tool_calls" if final_tools else "stop",
+                }
+            ],
+        }
+    )
+    yield _sse("[DONE]")
+
+
+@app.exception_handler(Exception)
+async def _unhandled_error(_: Request, exc: Exception) -> JSONResponse:
+    return JSONResponse(
+        status_code=502,
+        content={
+            "error": {
+                "message": str(exc),
+                "type": "upstream_error",
+                "code": "hy3_upstream_error",
+            }
+        },
+    )
+
+
+@app.get("/")
+@app.get("/health")
+async def health() -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "model": MODEL_ID,
+        "upstream": UPSTREAM_BASE_URL,
+        "max_concurrency": MAX_CONCURRENCY,
+        "max_input_chars": MAX_INPUT_CHARS,
+    }
+
+
+@app.get("/v1/models")
+async def models() -> dict[str, Any]:
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": MODEL_ID,
+                "object": "model",
+                "created": 1783344048,
+                "owned_by": "tencent",
+                "context_length": 262144,
+            }
+        ],
+    }
+
+
+@app.post("/v1/chat/completions")
+async def chat_completions(request: Request):
+    request_data = await request.json()
+    if not isinstance(request_data, dict):
+        raise HTTPException(status_code=400, detail="Request body must be an object")
+    if not request_data.get("messages"):
+        raise HTTPException(status_code=400, detail="messages is required")
+
+    model = str(request_data.get("model") or MODEL_ID)
+    _, original_history, _ = extract_conversation(request_data.get("messages") or [])
+    payload = build_upstream_payload(request_data)
+    retained_history = payload["data"][2] or []
+    dropped_messages = len(original_history) - len(retained_history)
+    request_chars = payload_size_chars(payload["data"])
+    if dropped_messages:
+        logger.warning(
+            "context_trim model=%s messages=%d retained=%d dropped=%d chars=%d budget=%d stream=%s",
+            model,
+            len(request_data.get("messages") or []),
+            len(retained_history),
+            dropped_messages,
+            request_chars,
+            MAX_INPUT_CHARS,
+            bool(request_data.get("stream")),
+        )
+    else:
+        logger.info(
+            "request model=%s messages=%d history=%d chars=%d stream=%s",
+            model,
+            len(request_data.get("messages") or []),
+            len(retained_history),
+            request_chars,
+            bool(request_data.get("stream")),
+        )
+
+    if request_data.get("stream"):
+        return StreamingResponse(
+            _openai_stream(request_data, payload, model),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    last_snapshot: dict[str, Any] | None = None
+    async for snapshot in _upstream_snapshots(payload):
+        last_snapshot = snapshot
+    if last_snapshot is None:
+        raise HTTPException(status_code=502, detail="Hy3 returned no response")
+
+    return build_nonstream_response(
+        model=model,
+        content=str(last_snapshot.get("content") or ""),
+        reasoning=str(last_snapshot.get("reasoning") or ""),
+        tool_calls=normalize_tool_calls(last_snapshot.get("tool_calls")),
+    )

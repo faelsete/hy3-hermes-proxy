@@ -1,0 +1,39 @@
+[Unit]
+Description=Tencent Hy3 OpenAI-compatible proxy for Hermes Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/projetos/hy3-hermes-proxy
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=HY3_SPACE_URL=https://tencent-hy3.hf.space
+Environment=HY3_MODEL_ID=tencent/hy3
+Environment=HY3_REQUEST_TIMEOUT=600
+Environment=HY3_MAX_CONCURRENCY=8
+Environment=HY3_MAX_RETRIES=2
+ExecStart=/root/projetos/hy3-hermes-proxy/.venv/bin/python -m uvicorn app:app --host 127.0.0.1 --port 8766 --workers 1 --no-access-log
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6
+MemoryMax=256M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,9 @@
+services:
+  hy3-proxy:
+    build: .
+    ports:
+      - "8766:8766"
+    restart: unless-stopped
+    environment:
+      HY3_SPACE_URL: https://tencent-hy3.hf.space
+      HY3_MAX_INPUT_CHARS: 150000
