@@ -20,9 +20,70 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
+import hashlib
+from pathlib import Path
+
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+
+# --- Conversations persistence (gaveta estilo ChatGPT) ---
+CONVERSATIONS_DIR = Path(os.getenv("HY3_CONVERSATIONS_DIR", "/var/lib/hy3-conversations"))
+try:
+    CONVERSATIONS_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    pass
+_CONV_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _sanitize_cid(cid: str) -> str:
+    cid = re.sub(r"[^a-zA-Z0-9_-]", "_", cid.strip())[:64]
+    return cid or "default"
+
+
+def _conv_path(cid: str) -> Path:
+    return CONVERSATIONS_DIR / f"{_sanitize_cid(cid)}.json"
+
+
+def _load_conversation(cid: str) -> list[dict[str, Any]]:
+    p = _conv_path(cid)
+    if not p.exists():
+        return []
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict) and isinstance(data.get("messages"), list):
+            return data["messages"]
+    except Exception:
+        pass
+    return []
+
+
+def _save_conversation(cid: str, messages: list[dict[str, Any]]):
+    p = _conv_path(cid)
+    # compacta se muito grande: mantém resumo + 50 recentes no disco também
+    if len(messages) > 80:
+        # mantém primeiro system + resumo das antigas + 50 recentes
+        system_msgs = [m for m in messages if m.get("role") in ("system", "developer")][:2]
+        rest = [m for m in messages if m.get("role") not in ("system", "developer")]
+        if len(rest) > 50:
+            old = rest[:-50]
+            recent = rest[-50:]
+            summary_parts = []
+            for m in old[:40]:
+                summary_parts.append(f"[{m.get('role')}] {str(m.get('content') or '')[:200]}")
+            summary = TRIM_NOTICE + f"\n[RESUMO PERSISTENTE {len(old)} msgs antigas]\n" + "\n".join(summary_parts)
+            rest = [{"role": "system", "content": summary}] + recent
+        messages = system_msgs + rest
+    p.write_text(json.dumps(messages, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _get_conv_lock(cid: str) -> asyncio.Lock:
+    cid = _sanitize_cid(cid)
+    if cid not in _CONV_LOCKS:
+        _CONV_LOCKS[cid] = asyncio.Lock()
+    return _CONV_LOCKS[cid]
 
 UPSTREAM_BASE_URL = os.getenv(
     "HY3_SPACE_URL", "https://tencent-hy3.hf.space"
@@ -1286,6 +1347,7 @@ async def _unhandled_error(_: Request, exc: Exception) -> JSONResponse:
 @app.get("/")
 @app.get("/health")
 async def health() -> dict[str, Any]:
+    conv_count = len(list(CONVERSATIONS_DIR.glob("*.json"))) if CONVERSATIONS_DIR.exists() else 0
     return {
         "status": "ok",
         "model": MODEL_ID,
@@ -1294,12 +1356,49 @@ async def health() -> dict[str, Any]:
         "max_input_chars": MAX_INPUT_CHARS,
         "context_length": CONTEXT_LENGTH_TOKENS,
         "kv_cache_size": len(_KV_PREFIX_CACHE),
+        "conversations": conv_count,
         "fallback": "step" if STEP_FALLBACK else ("minimax" if MINIMAX_FALLBACK else None),
         "step_fallback": STEP_FALLBACK,
         "step_upstream": STEP_SPACE_URL if STEP_FALLBACK else None,
         "minimax_selectable": MINIMAX_FALLBACK,
         "minimax_upstream": MINIMAX_SPACE_URL if MINIMAX_FALLBACK else None,
     }
+
+
+# --- Conversation gaveta endpoints (estilo ChatGPT/Luna) ---
+@app.get("/v1/conversations")
+async def list_conversations():
+    files = list(CONVERSATIONS_DIR.glob("*.json"))
+    data = []
+    for p in files:
+        cid = p.stem
+        msgs = _load_conversation(cid)
+        data.append({"id": cid, "messages": len(msgs), "updated": int(p.stat().st_mtime)})
+    return {"object": "list", "data": sorted(data, key=lambda x: x["updated"], reverse=True)}
+
+
+@app.get("/v1/conversations/{cid}")
+async def get_conversation(cid: str):
+    msgs = _load_conversation(cid)
+    if not msgs and not _conv_path(cid).exists():
+        raise HTTPException(status_code=404, detail="conversation not found")
+    return {"id": _sanitize_cid(cid), "object": "conversation", "messages": msgs}
+
+
+@app.delete("/v1/conversations/{cid}")
+async def delete_conversation(cid: str):
+    p = _conv_path(cid)
+    if p.exists():
+        p.unlink()
+    return {"id": _sanitize_cid(cid), "deleted": True}
+
+
+@app.post("/v1/conversations/{cid}/clear")
+async def clear_conversation(cid: str):
+    p = _conv_path(cid)
+    if p.exists():
+        p.unlink()
+    return {"id": _sanitize_cid(cid), "cleared": True}
 
 
 @app.get("/v1/models")
@@ -1343,6 +1442,50 @@ async def chat_completions(request: Request):
         raise HTTPException(status_code=400, detail="Request body must be an object")
     if not request_data.get("messages"):
         raise HTTPException(status_code=400, detail="messages is required")
+
+    # --- Gaveta: se veio conversation_id, carrega/acumula histórico persistente ---
+    raw_cid = request_data.get("conversation_id") or request_data.get("session_id") or request_data.get("thread_id")
+    cid = _sanitize_cid(str(raw_cid)) if raw_cid else None
+    if cid:
+        async with _get_conv_lock(cid):
+            stored = _load_conversation(cid)
+            incoming = request_data.get("messages") or []
+            # Se stored já existe e incoming tem só 1-2 msgs novas, trata como delta
+            if stored and len(incoming) <= 2:
+                # delta: só adiciona o último user novo
+                for m in incoming:
+                    if m.get("role") == "user":
+                        last_content = _text_content(m.get("content")).strip()
+                        # evita duplicar se já é igual ao último user armazenado
+                        last_stored_user = next((x for x in reversed(stored) if x.get("role") == "user"), None)
+                        if not last_stored_user or _text_content(last_stored_user.get("content")).strip() != last_content:
+                            # preserva system separado
+                            if m.get("role") == "system":
+                                stored.insert(0, m)
+                            else:
+                                stored.append(_clean_history_message(m) or m)
+                        break
+                    elif m.get("role") in ("system", "developer"):
+                        # atualiza system se mudou
+                        if not any(_text_content(s.get("content")) == _text_content(m.get("content")) for s in stored if s.get("role") == "system"):
+                            stored.insert(0, m)
+                effective = stored
+            elif stored and len(incoming) > len(stored):
+                # cliente mandou histórico completo maior -> usa ele e atualiza gaveta
+                effective = incoming
+            elif stored:
+                # incoming é histórico completo menor ou igual -> usa stored (mais completo)
+                effective = stored
+                # mas se incoming tem user novo no final, adiciona
+                last_in = incoming[-1] if incoming else None
+                if last_in and last_in.get("role") == "user":
+                    if not any(_text_content(s.get("content")).strip() == _text_content(last_in.get("content")).strip() for s in stored[-3:] if s.get("role") == "user"):
+                        effective = stored + [last_in]
+            else:
+                effective = incoming
+            request_data = {**request_data, "messages": effective}
+            # guarda cid para salvar resposta depois
+            request_data["_cid"] = cid
 
     model = str(request_data.get("model") or MODEL_ID)
     force_minimax = MINIMAX_FALLBACK and "minimax" in model.lower()
@@ -1518,6 +1661,30 @@ async def chat_completions(request: Request):
         kv_cache_set(kv_key, content[:2000])
     except Exception:
         pass
+    # Gaveta: persiste conversa completa (histórico + resposta) para loop infinito
+    cid_save = request_data.get("_cid")
+    if cid_save:
+        try:
+            async with _get_conv_lock(cid_save):
+                stored_now = _load_conversation(cid_save)
+                # Se effective já era stored, só adiciona a resposta; senão salva effective+resposta
+                effective_for_save = request_data.get("messages") or []
+                # evita duplicar: se stored já tem effective, usa stored
+                if len(stored_now) >= len(effective_for_save) - 2:
+                    base = stored_now if len(stored_now) > len(effective_for_save) else effective_for_save
+                else:
+                    base = effective_for_save
+                # adiciona resposta do assistant
+                tool_calls_norm = normalize_tool_calls(last_snapshot.get("tool_calls"))
+                assistant_msg: dict[str, Any] = {"role": "assistant", "content": content}
+                if tool_calls_norm:
+                    assistant_msg["tool_calls"] = tool_calls_norm
+                if reasoning:
+                    assistant_msg["reasoning_content"] = reasoning
+                base = list(base) + [assistant_msg]
+                _save_conversation(cid_save, base)
+        except Exception as e:
+            logger.warning("gaveta save failed cid=%s: %s", cid_save, e)
     return build_nonstream_response(
         model=model,
         content=content,
