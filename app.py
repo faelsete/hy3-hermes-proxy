@@ -100,10 +100,10 @@ MAX_OUTPUT_TOKENS = max(
     DEFAULT_MAX_TOKENS, int(os.getenv("HY3_MAX_OUTPUT_TOKENS", "65536"))
 )
 CONTEXT_LENGTH_TOKENS = 262144
-# KV-cache simulation: in-memory prefix cache (10 min TTL, 50 entries)
+# KV-cache simulation: in-memory prefix cache (30 min TTL, 500 entries) - CACHE GRANDE
 _KV_PREFIX_CACHE: dict[str, tuple[float, str]] = {}
-_KV_CACHE_TTL = 600
-_KV_CACHE_MAX = 50
+_KV_CACHE_TTL = 1800
+_KV_CACHE_MAX = 500
 
 # --- MiniMax-Text-01 fallback (disabled by default, keep proxy strictly on Hy3) ---
 MINIMAX_FALLBACK = os.getenv("MINIMAX_FALLBACK", "0") == "1"
@@ -240,6 +240,25 @@ def _text_content(content: Any) -> str:
     return str(content)
 
 
+def _repair_json_arguments(args: str) -> str | None:
+    if not isinstance(args, str):
+        return None
+    try:
+        json.loads(args)
+        return args
+    except Exception:
+        pass
+    # Tenta reparar JSON truncado comum
+    for suffix in ['"}', '"}}', '}', '"]}', '"]}']:
+        try:
+            fixed = args + suffix
+            json.loads(fixed)
+            return fixed
+        except Exception:
+            pass
+    return None
+
+
 def _clean_history_message(message: dict[str, Any]) -> dict[str, Any] | None:
     role = str(message.get("role", "")).strip()
     if role not in {"user", "assistant", "tool"}:
@@ -253,7 +272,22 @@ def _clean_history_message(message: dict[str, Any]) -> dict[str, Any] | None:
         if message.get(key) is not None:
             cleaned[key] = message[key]
     if role == "assistant" and message.get("tool_calls"):
-        cleaned["tool_calls"] = message["tool_calls"]
+        valid_calls = []
+        for tc in message.get("tool_calls", []):
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get("function")
+            if not isinstance(fn, dict) or not fn.get("name"):
+                continue
+            raw_args = fn.get("arguments", "{}")
+            repaired_args = _repair_json_arguments(raw_args)
+            if repaired_args is not None:
+                tc_clean = dict(tc)
+                tc_clean["function"] = dict(fn)
+                tc_clean["function"]["arguments"] = repaired_args
+                valid_calls.append(tc_clean)
+        if valid_calls:
+            cleaned["tool_calls"] = valid_calls
     return cleaned
 
 
