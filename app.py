@@ -119,6 +119,21 @@ STEP_SPACE_URL = os.getenv(
 ).rstrip("/")
 STEP_MODEL_ID = os.getenv("STEP_MODEL_ID", "step/step-3-7-flash")
 
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+if not OPENROUTER_API_KEY:
+    _keys_file = Path("/root/.agents/keys.env")
+    if _keys_file.is_file():
+        try:
+            for _line in _keys_file.read_text(encoding="utf-8").splitlines():
+                if _line.startswith("OPENROUTER_API_KEY="):
+                    OPENROUTER_API_KEY = _line.split("=", 1)[1].strip().strip("'\"")
+                    break
+        except Exception:
+            pass
+OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
+HY4_MODEL_ID = os.getenv("HY4_MODEL_ID", "tencent/hy4-preview")
+HY4_CONTEXT_LENGTH = 1000000
+
 TRIM_NOTICE = (
     "[Nota de contexto: Histórico anterior compactado para manter agilidade. "
     "Mantenha a resposta em Português do Brasil.]"
@@ -1174,6 +1189,74 @@ async def _minimax_stream(
     yield _sse("[DONE]")
 
 
+async def _hy4_stream(request_data: dict[str, Any], model: str) -> AsyncIterator[str]:
+    payload = {
+        "model": HY4_MODEL_ID,
+        "messages": request_data.get("messages", []),
+        "stream": True,
+    }
+    for key in ("temperature", "top_p", "max_tokens", "tools", "tool_choice", "response_format"):
+        if key in request_data:
+            payload[key] = request_data[key]
+
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "HTTP-Referer": "https://visionos.local",
+        "X-Title": "VisionOS",
+        "Content-Type": "application/json",
+    }
+    timeout = httpx.Timeout(180.0, connect=30.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        async with client.stream(
+            "POST",
+            f"{OPENROUTER_BASE_URL}/chat/completions",
+            json=payload,
+            headers=headers,
+        ) as resp:
+            if resp.status_code != 200:
+                err_text = await resp.aread()
+                logger.error("Hy4 OpenRouter error %d: %s", resp.status_code, err_text[:300])
+                yield _sse({"error": f"OpenRouter HTTP {resp.status_code}: {err_text.decode(errors='ignore')[:200]}"})
+                yield _sse("[DONE]")
+                return
+            async for line in resp.aiter_lines():
+                if line:
+                    if line.startswith("data: "):
+                        yield f"{line}\n\n"
+                    elif line.startswith("data:"):
+                        yield f"{line[:5]} {line[5:]}\n\n"
+                    else:
+                        yield f"data: {line}\n\n"
+
+
+async def hy4_complete(request_data: dict[str, Any], model: str) -> dict[str, Any]:
+    payload = {
+        "model": HY4_MODEL_ID,
+        "messages": request_data.get("messages", []),
+        "stream": False,
+    }
+    for key in ("temperature", "top_p", "max_tokens", "tools", "tool_choice", "response_format"):
+        if key in request_data:
+            payload[key] = request_data[key]
+
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "HTTP-Referer": "https://visionos.local",
+        "X-Title": "VisionOS",
+        "Content-Type": "application/json",
+    }
+    timeout = httpx.Timeout(180.0, connect=30.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.post(
+            f"{OPENROUTER_BASE_URL}/chat/completions",
+            json=payload,
+            headers=headers,
+        )
+        if resp.status_code != 200:
+            raise HTTPException(status_code=resp.status_code, detail=f"OpenRouter Hy4 error: {resp.text[:300]}")
+        return resp.json()
+
+
 
 
 async def _to_data_url(url: str) -> str | None:
@@ -1439,6 +1522,27 @@ async def clear_conversation(cid: str):
 async def models() -> dict[str, Any]:
     data = [
         {
+            "id": HY4_MODEL_ID,
+            "object": "model",
+            "created": 1787887996,
+            "owned_by": "tencent",
+            "context_length": HY4_CONTEXT_LENGTH,
+        },
+        {
+            "id": "tencent/hy4",
+            "object": "model",
+            "created": 1787887996,
+            "owned_by": "tencent",
+            "context_length": HY4_CONTEXT_LENGTH,
+        },
+        {
+            "id": "hy4",
+            "object": "model",
+            "created": 1787887996,
+            "owned_by": "tencent",
+            "context_length": HY4_CONTEXT_LENGTH,
+        },
+        {
             "id": MODEL_ID,
             "object": "model",
             "created": 1783344048,
@@ -1524,6 +1628,30 @@ async def chat_completions(request: Request):
     model = str(request_data.get("model") or MODEL_ID)
     force_minimax = MINIMAX_FALLBACK and "minimax" in model.lower()
     force_step = STEP_FALLBACK and "step" in model.lower()
+    force_hy4 = any(k in model.lower() for k in ("hy4", "hunyuan-4", "hunyuan4"))
+
+    if force_hy4:
+        logger.info(
+            "routing to Hy4 (%s) stream=%s",
+            HY4_MODEL_ID,
+            bool(request_data.get("stream")),
+        )
+        if request_data.get("stream"):
+            return StreamingResponse(
+                _hy4_stream(request_data, model),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+        data = await hy4_complete(request_data, model)
+        cid = request_data.get("_cid")
+        if cid and data.get("choices"):
+            msg_resp = data["choices"][0].get("message")
+            if msg_resp:
+                async with _get_conv_lock(cid):
+                    s = _load_conversation(cid)
+                    s.append(msg_resp)
+                    _save_conversation(cid, s)
+        return JSONResponse(data)
 
     if force_minimax:
         logger.info(
