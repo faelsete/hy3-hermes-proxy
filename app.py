@@ -1254,7 +1254,18 @@ async def hy4_complete(request_data: dict[str, Any], model: str) -> dict[str, An
         )
         if resp.status_code != 200:
             raise HTTPException(status_code=resp.status_code, detail=f"OpenRouter Hy4 error: {resp.text[:300]}")
-        return resp.json()
+        data = resp.json()
+        if data.get("choices"):
+            choice_msg = data["choices"][0].get("message") or {}
+            c_content = choice_msg.get("content")
+            c_tools = choice_msg.get("tool_calls")
+            if (c_content is None or not str(c_content).strip()) and not c_tools:
+                c_reason = choice_msg.get("reasoning") or choice_msg.get("reasoning_content")
+                if c_reason and str(c_reason).strip():
+                    choice_msg["content"] = str(c_reason).strip()
+                else:
+                    choice_msg["content"] = "Comando processado com sucesso pelo modelo."
+        return data
 
 
 
